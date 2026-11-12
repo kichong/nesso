@@ -14,8 +14,8 @@ import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { packageLimits, preparePluginPackage } from '@nesso-how/plugin/package'
-import { createPluginStorage } from './plugin-storage.ts'
-import themeFixture from '../packages/plugin/test/theme.json' with { type: 'json' }
+import { createPluginStorage } from './index.ts'
+import themeFixture from '../../packages/plugin/test/theme.json' with { type: 'json' }
 
 test('installed actions restore verified bytes offline, reject conflicts and cancellation, and preserve valid records on failure or removal', async (t) => {
   const directory = await mkdtemp(path.join(tmpdir(), 'nesso-packages-'))
@@ -288,6 +288,7 @@ test('unreadable records are isolated without losing valid packages or permittin
   const recordName = `${createHash('sha256').update(bad.name).digest('hex')}.json`
   const file = path.join(directory, recordName)
   const original = await readFile(file)
+  const current = JSON.parse(original.toString())
   const document = path.join(directory, 'document.bin')
   await writeFile(document, 'Unrelated document data')
   const records = new Map(
@@ -303,7 +304,14 @@ test('unreadable records are isolated without losing valid packages or permittin
     [Buffer.from(JSON.stringify({ ...bad, enabled: 'true' })), bad.name],
     [Buffer.from(JSON.stringify({ ...bad, npmIntegrity: 'invalid' })), bad.name],
     [Buffer.from(JSON.stringify({ ...bad, code: 'tampered' })), bad.name],
+    [Buffer.from(JSON.stringify({ ...bad, extra: true })), bad.name],
     [Buffer.from(JSON.stringify(valid))],
+    [Buffer.from(JSON.stringify({ ...current, version: 2 }))],
+    [Buffer.from(JSON.stringify({ ...current, extra: true })), bad.name],
+    [
+      Buffer.from(JSON.stringify({ ...current, package: { ...current.package, extra: true } })),
+      bad.name,
+    ],
   ] as const) {
     await writeFile(file, bytes)
     const listing = await createPluginStorage(directory).list()
@@ -416,4 +424,84 @@ test('corrupt records still consume record, count, and aggregate scan budgets', 
   await assert.rejects(storage.list(), /Installed package budget exceeded/)
   for (const file of files) await writeFile(file, '{')
   await assert.rejects(storage.list(), /Installed package budget exceeded/)
+})
+
+test('legacy records are read unchanged and upgrade only after their exact originals are preserved', async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'nesso-legacy-packages-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const storage = createPluginStorage(directory)
+  const npmIntegrity = `sha512-${Buffer.alloc(64).toString('base64')}`
+  const legacy = []
+  for (const kind of ['actions', 'theme', 'vocab'] as const) {
+    const entry = kind === 'actions' ? 'index.js' : 'definition.json'
+    const definition =
+      kind === 'theme'
+        ? { ...themeFixture, id: 'legacy-theme' }
+        : {
+            id: 'legacy-vocab',
+            relationTypes: [{ id: 'urn:nesso:legacy', label: 'Legacy' }],
+            defaultTypeId: 'urn:nesso:legacy',
+          }
+    const prepared = await preparePluginPackage({
+      manifest: {
+        name: `nesso-legacy-${kind}`,
+        version: '1.0.0',
+        nesso: { apiVersion: 4, kind, entry, writes: [], capabilities: [] },
+        i18n: {
+          metadata: {
+            name: { en: kind },
+            description: { en: 'Test' },
+            documentation: { en: 'Test' },
+          },
+        },
+      },
+      files: [
+        {
+          path: entry,
+          bytes: new TextEncoder().encode(
+            kind === 'actions' ? 'export const create=()=>[]' : JSON.stringify(definition),
+          ),
+        },
+      ],
+    })
+    const record = {
+      ...prepared,
+      ...(kind === 'theme' ? { npmIntegrity } : {}),
+      enabled: kind !== 'vocab',
+    }
+    const file = path.join(
+      directory,
+      `${createHash('sha256').update(prepared.name).digest('hex')}.json`,
+    )
+    await writeFile(file, JSON.stringify(record))
+    const bytes = await readFile(file)
+    const backup = `${file}.backup-${createHash('sha256').update(bytes).digest('hex')}`
+    legacy.push({ prepared, record, file, bytes, backup })
+  }
+  const listing = await storage.list()
+  assert.deepEqual(new Set(listing.packages), new Set(legacy.map(({ record }) => record)))
+  assert.deepEqual(listing.issues, [])
+  for (const { file, bytes } of legacy) assert.deepEqual(await readFile(file), bytes)
+  const [action, theme] = legacy
+  await mkdir(action.backup)
+  await assert.rejects(storage.setEnabled(action.prepared.contentId, false))
+  assert.deepEqual(await readFile(action.file), action.bytes)
+  await rm(action.backup, { recursive: true })
+  await storage.setEnabled(action.prepared.contentId, false)
+  await storage.setEnabled(theme.prepared.contentId, true)
+  await storage.setEnabled(action.prepared.contentId, true)
+  for (const { backup, bytes } of [action, theme]) assert.deepEqual(await readFile(backup), bytes)
+  assert.equal(
+    await readFile(action.file, 'utf8'),
+    JSON.stringify({ version: 1, package: action.prepared, enabled: true }),
+  )
+  assert.equal(
+    await readFile(theme.file, 'utf8'),
+    JSON.stringify({ version: 1, package: theme.prepared, enabled: true, npmIntegrity }),
+  )
+  assert.equal((await readdir(directory)).length, 5)
+  assert.deepEqual(
+    new Set((await createPluginStorage(directory).list()).packages),
+    new Set([{ ...action.record, enabled: true }, theme.record, legacy[2].record]),
+  )
 })
