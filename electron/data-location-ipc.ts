@@ -2,7 +2,7 @@ import { app, BrowserWindow, dialog, ipcMain, shell, type IpcMainInvokeEvent } f
 import { realpath } from 'node:fs/promises'
 import path from 'node:path'
 import { NessoError } from '@nesso-how/errors'
-import type { DataLocation } from './data-location.ts'
+import type { DataLocation } from './data-location/index.ts'
 import { ElectronError } from './errors.ts'
 import type { TrustedRequest } from './ipc.ts'
 import { onDocumentNavigation } from './navigation.ts'
